@@ -39,31 +39,126 @@ command=$1
 basename=$2
 dshsleep=$3
 
+
 # go to working directory
 cd $PBS_O_WORKDIR
+
 
 # set job index in terms of the dsh task number
 job=`expr $PBS_TASKNUM - 1`
 
-# sleep jobs to avoid bottlenecks
-if [ $job -gt 1 ]; then
 
-    # all jobs but the first sleep 1 second
-    sleep 1
+# job string
+jobstr=$(printf "job %04d" $job)
 
-    # sleep some more if needed, until the lock file is created
-    while [ ! -e $basename.lock ]; do
-        echo "SLEEPING job $job because there is no lock file yet"
-        sleep 1
+
+# log function to write messages to the log file
+function log {
+    echo $(date) "["$(date +%H:%M:%S.%N)"]: $jobstr: $1"
+}
+
+
+# quit function if simulation is done
+function quit_if_done {
+    done=$(grep -o END $basename.egsjob)
+    if [ "$done" = "END" ]; then
+        log "QUIT (simulation already finished)"
+        exit
+    fi
+}
+
+
+# manage jobs to avoid bottleneck and race conditions
+if [ $job -eq 1 ]; then
+
+    # log host and pid of job 1 in .egsjob file
+    log "host=$(hostname) pid=$$ BEGIN" > $basename.egsjob
+
+else
+
+    # log the host and pid of this job
+    log "host=$(hostname) pid=$$"
+
+    # all jobs wait a fixed delay (relative to first job)
+    delay=1
+    log "sleep $delay seconds (initial delay)"
+    sleep $delay
+
+    # wait until there is an .egsjob file (maximum 120 seconds)
+    total=0
+    delay=10
+    limit=120
+    while [ ! -e $basename.egsjob ]; do
+        log "sleep $delay seconds (no $basename.egsjob file after $total seconds)"
+        sleep $delay
+        total=$((total+$delay))
+        if [ $total -gt $limit ]; then
+            log "QUIT (no $basename.egsjob file after $limit seconds)"
+            exit
+        fi
     done
 
-    # space all jobs by at least 0.5 seconds, to avoid race condition on lock file
-    usleep $(($job*500000))
+    # sleep until there is a lock file, maximum 300 seconds
+    total=0
+    delay=10
+    limit=300
+    while [ ! -e $basename.lock ]; do
 
-    # extra user-specified sleep seconds between each job
-    sleep $(($job*$dshsleep))
+        # quit if simulation is already done
+        quit_if_done
+
+        # otherwise wait for lock file
+        log "sleep $delay seconds ($basename.lock not found after $total seconds)"
+        sleep $delay
+        total=$((total+$delay))
+        if [ $total -gt $limit ]; then
+            log "QUIT ($basename.lock not found after $limit seconds)"
+            exit
+        fi
+    done
+
+    # offset all jobs by a fixed delay (relative to previous job)
+    delay=1000000
+    log "sleep $((job*$delay)) microseconds (job offset)"
+    for j in $(seq 1 $job); do
+        usleep $delay
+        quit_if_done
+    done
+
+    # extra user-specified delay between each job
+    delay=$dshsleep
+    if [ $delay -gt 0 ]; then
+        log "sleep $((job*$dshsleep)) seconds (user-specififed offset)"
+        for j in $(seq 1 $job); do
+            usleep $delay
+            quit_if_done
+        done
+    fi
+
+    # report on lock file content
+    if [ -e $basename.lock ]; then
+        content=$(cat $basename.lock)
+        log "found $basename.lock: $content"
+    else
+        log "QUIT ($basename.lock does not exist anymore)"
+        exit
+    fi
+
 fi
 
-# launch the job
+
+# launch the job if simulation is not done
+quit_if_done
+log "RUN $command -j $job"
 $command -j $job
 
+
+# report that this job is done
+log "DONE."
+
+
+# report that the simulation (job 1) is done
+if [ $job -eq 1 ]; then
+    log "FINISH simulation"
+    log "host=$(hostname) pid=$$ END" >> $basename.egsjob
+fi
